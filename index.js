@@ -1,77 +1,99 @@
 #!/usr/bin/env node
 
-import axios from 'axios'
-import minimist from 'minimist'
-import { v4 as uuidv4 } from 'uuid'
+import axios from "axios";
+import minimist from "minimist";
+import { v4 as uuidv4 } from "uuid";
+import path from "path";
 
-const BB_API_URL = 'https://api.bitbucket.org/2.0/repositories'
+const BB_API_URL = "https://api.bitbucket.org/2.0/repositories";
 const argv = minimist(process.argv.slice(2));
 
-const BB_USER = argv['user']
-const BB_APP_PASSWORD = argv['password']
-const BB_TOKEN = argv['token']
-const REPO = argv['repo']
-const COMMIT = argv['commit']
-const WORKSPACE = argv['workspace']
+// CLI options
+const BB_USER = argv["user"];
+const BB_APP_PASSWORD = argv["password"];
+const BB_TOKEN = argv["token"];
+const REPO = argv["repo"];
+const COMMIT = argv["commit"];
+const WORKSPACE = argv["workspace"];
+
+const FAIL_ON_HIGH = argv["fail-on-high"] || false;
+const FAIL_ON_CRITICAL = argv["fail-on-critical"] || false;
+const MAX_ANNOTATIONS = argv["max-annotations"] ?? 100;
 
 // ------------------------------------------------------------
-// SMART SUMMARY (max 450 chars)
+// RELATIVE PATH NORMALIZATION
+// ------------------------------------------------------------
+function normalizePath(p) {
+  if (!p) return "unknown";
+
+  return p
+    .replace(/^file:\/\//, "") // remove file://
+    .replace(/^\/+/, "") // remove leading /
+    .replace(process.cwd(), "") // remove absolute root
+    .replace(/^app\//, "") // fix docker volume path
+    .trim();
+}
+
+// ------------------------------------------------------------
+// SMART SUMMARY (≤450 chars)
 // ------------------------------------------------------------
 function smartSummary(text) {
   if (!text) return "";
   text = text.trim();
 
-  const firstSentence = text.split('. ')[0] + '.';
+  const firstSentence = text.split(". ")[0] + ".";
   if (firstSentence.length <= 450) return firstSentence;
 
   if (text.length <= 450) return text;
 
   let truncated = text.slice(0, 450);
-  truncated = truncated.replace(/\s+\S*$/, '');
+  truncated = truncated.replace(/\s+\S*$/, "");
   return truncated + "...";
 }
 
 // ------------------------------------------------------------
-// SEVERITY INFERENCE ENGINE
+// ENHANCED SEVERITY INFERENCE ENGINE (v2.1.0)
 // ------------------------------------------------------------
 function inferSeverity(ruleId, text) {
   const s = (ruleId + " " + text).toLowerCase();
 
   // CRITICAL
-  if (/(rce|remote code|command injection|prototype pollution|sql injection|arbitrary file write|directory traversal)/.test(s))
+  if (/(rce|remote code|command injection|prototype pollution|sql injection|path traversal|arbitrary file write|takeover)/.test(s))
     return "CRITICAL";
 
   // HIGH
-  if (/(csrf|xss|cross[- ]site|auth bypass|authorization|insecure deserialization|hardcoded|sensitive data|jwt|token)/.test(s))
+  if (/(csrf|xss|cross[- ]site|auth bypass|authorization|hardcoded|jwt|token|insecure deserialization|open redirect)/.test(s))
     return "HIGH";
 
   // MEDIUM
-  if (/(missing integrity|weak crypt|md5|sha1|insecure|http:\/|audit)/.test(s))
+  if (/(missing integrity|weak crypt|md5|sha1|audit|insecure configuration|skip-tls|insecure)/.test(s))
     return "MEDIUM";
 
+  // LOW
   return "LOW";
 }
 
 // ------------------------------------------------------------
-// VALIDATION
+// BASIC VALIDATION
 // ------------------------------------------------------------
 const paramsAreValid = () => {
   if (!BB_TOKEN && !BB_USER) {
-    console.log('Error: specify either token or user')
-    return false
+    console.log("Error: specify either token or user");
+    return false;
   }
 
   if (!BB_TOKEN && !BB_APP_PASSWORD) {
-    console.log('Error: specify either token or password')
-    return false
+    console.log("Error: specify either token or password");
+    return false;
   }
 
-  if (!REPO) { console.log('Error: specify repo'); return false }
-  if (!COMMIT) { console.log('Error: specify commit'); return false }
-  if (!WORKSPACE) { console.log('Error: specify workspace'); return false }
+  if (!REPO || !COMMIT || !WORKSPACE) {
+    console.log("Error: repo/commit/workspace required");
+    return false;
+  }
 
-  return true
-}
+  return true;
+};
 
 // ------------------------------------------------------------
 // SARIF HELPERS
@@ -79,70 +101,99 @@ const paramsAreValid = () => {
 const rulesAsMap = (rules) =>
   rules.reduce((map, rule) => ({ ...map, [rule.id]: rule }), {});
 
-const getPath = (result) =>
-  result.locations?.[0]?.physicalLocation?.artifactLocation?.uri ?? "unknown";
-
-const getLine = (result) =>
-  result.locations?.[0]?.physicalLocation?.region?.startLine ?? 1;
-
 const getRuleText = (result, rulesMap) => {
   const rule = rulesMap[result.ruleId];
-  if (!rule) return "";
-
   return (
-    rule.fullDescription?.text ??
-    rule.shortDescription?.text ??
+    rule?.fullDescription?.text ??
+    rule?.shortDescription?.text ??
     result.message?.text ??
     ""
   );
 };
 
 // ------------------------------------------------------------
-// MAP SARIF → Bitbucket ISSUE format
+// MAP SARIF → Bitbucket ISSUE Annotations
 // ------------------------------------------------------------
-const mapSarif = (sarif) => {
+function mapSarif(sarif) {
   const rulesMap = rulesAsMap(sarif.runs[0].tool.driver.rules);
 
-  return sarif.runs[0].results.map(result => {
+  let items = sarif.runs[0].results.map((result) => {
     const fullText = getRuleText(result, rulesMap);
     const severity = inferSeverity(result.ruleId, fullText);
+
+    const relPath = normalizePath(
+      result.locations?.[0]?.physicalLocation?.artifactLocation?.uri
+    );
 
     return {
       external_id: uuidv4(),
       annotation_type: "ISSUE",
-      severity: severity,                  // CRITICAL / HIGH / MEDIUM / LOW
+      severity: severity,
       title: smartSummary(fullText),
+      summary: smartSummary(fullText), // REQUIRED FIELD
       message: fullText,
-      path: getPath(result),
-      line: getLine(result)
+      path: relPath,
+      line:
+        result.locations?.[0]?.physicalLocation?.region?.startLine ?? 1,
+      ruleId: result.ruleId,
     };
   });
-};
 
-// ------------------------------------------------------------
-// Compute severity stats
-// ------------------------------------------------------------
-function computeSeverityStats(vulns) {
-  const counts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
+  // Deduplicate issues
+  const unique = new Map();
+  items.forEach((i) =>
+    unique.set(`${i.ruleId}_${i.path}_${i.line}`, i)
+  );
 
-  vulns.forEach(v => counts[v.severity]++);
-
-  const highest =
-    counts.CRITICAL > 0 ? "CRITICAL" :
-    counts.HIGH > 0 ? "HIGH" :
-    counts.MEDIUM > 0 ? "MEDIUM" :
-    "LOW";
-
-  return { highest, counts };
+  // Sorted by severity priority
+  return [...unique.values()].sort(
+    (a, b) =>
+      ["CRITICAL", "HIGH", "MEDIUM", "LOW"].indexOf(a.severity) -
+      ["CRITICAL", "HIGH", "MEDIUM", "LOW"].indexOf(b.severity)
+  );
 }
 
-function severityLabel(sev) {
-  return {
-    CRITICAL: "Critical risk",
-    HIGH: "High risk",
-    MEDIUM: "Medium risk",
-    LOW: "Low risk"
-  }[sev] || "No findings";
+// ------------------------------------------------------------
+// Severity stats + Markdown details
+// ------------------------------------------------------------
+function buildDetails(vulns) {
+  const counts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
+  const perRule = {};
+
+  vulns.forEach((v) => {
+    counts[v.severity]++;
+    perRule[v.ruleId] = (perRule[v.ruleId] ?? 0) + 1;
+  });
+
+  const highest =
+    counts.CRITICAL > 0
+      ? "CRITICAL"
+      : counts.HIGH > 0
+      ? "HIGH"
+      : counts.MEDIUM > 0
+      ? "MEDIUM"
+      : "LOW";
+
+  const summary = `
+### 🔐 Security Scan Summary
+
+#### Findings by severity:
+- **CRITICAL:** ${counts.CRITICAL}
+- **HIGH:** ${counts.HIGH}
+- **MEDIUM:** ${counts.MEDIUM}
+- **LOW:** ${counts.LOW}
+
+#### Highest severity: **${highest}**
+
+---
+
+### 🔎 Findings by Rule ID:
+${Object.entries(perRule)
+  .map(([rule, count]) => `- \`${rule}\`: **${count}**`)
+  .join("\n")}
+`;
+
+  return { summary, highest };
 }
 
 // ------------------------------------------------------------
@@ -154,24 +205,19 @@ const sarifToBitBucket = async (sarifRaw) => {
   const scanId = scanName.replace(/\s+/g, "").toLowerCase();
 
   let vulns = mapSarif(sarif);
-  const stats = computeSeverityStats(vulns);
+  const { summary, highest } = buildDetails(vulns);
 
-  const resultStatus =
-    stats.highest === "CRITICAL" || stats.highest === "HIGH"
-      ? "FAILED"
-      : "PASSED";
+  // Determine PR fail/pass state
+  let resultStatus = "PASSED";
+  if (highest === "CRITICAL") resultStatus = "FAILED";
+  if (FAIL_ON_HIGH && (highest === "HIGH" || highest === "CRITICAL"))
+    resultStatus = "FAILED";
+  if (FAIL_ON_CRITICAL && highest === "CRITICAL")
+    resultStatus = "FAILED";
 
-  const details =
-    `Security scan summary:\n\n` +
-    `Findings by severity:\n` +
-    `• CRITICAL: ${stats.counts.CRITICAL}\n` +
-    `• HIGH: ${stats.counts.HIGH}\n` +
-    `• MEDIUM: ${stats.counts.MEDIUM}\n` +
-    `• LOW: ${stats.counts.LOW}\n\n` +
-    `Highest severity: ${severityLabel(stats.highest)}.\n`;
-
-  if (vulns.length > 100)
-    vulns = vulns.slice(0, 100);
+  // Limit annotations
+  if (vulns.length > MAX_ANNOTATIONS)
+    vulns = vulns.slice(0, MAX_ANNOTATIONS);
 
   const config = BB_TOKEN
     ? { headers: { Authorization: `Bearer ${BB_TOKEN}` } }
@@ -191,7 +237,7 @@ const sarifToBitBucket = async (sarifRaw) => {
       report_type: "SECURITY",
       reporter: "sarif-to-bb-token",
       result: resultStatus,
-      details: details
+      details: summary,
     },
     config
   );
@@ -205,13 +251,13 @@ const sarifToBitBucket = async (sarifRaw) => {
 };
 
 // ------------------------------------------------------------
-// Handle stdin input
+// READ STDIN
 // ------------------------------------------------------------
 const getInput = () =>
   new Promise((resolve, reject) => {
     let data = "";
     process.stdin.setEncoding("utf8");
-    process.stdin.on("data", chunk => (data += chunk));
+    process.stdin.on("data", (chunk) => (data += chunk));
     process.stdin.on("end", () => resolve(data));
     process.stdin.on("error", reject);
   });
