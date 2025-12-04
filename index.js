@@ -14,39 +14,31 @@ const REPO = argv['repo']
 const COMMIT = argv['commit']
 const WORKSPACE = argv['workspace']
 
-// ------------------------------
-// SMART SUMMARY IMPLEMENTATION
-// ------------------------------
+// ------------------------------------------------------------
+// SMART SUMMARY LIMITER (<= 450 chars guaranteed)
+// ------------------------------------------------------------
 
 function smartSummary(text) {
   if (!text) return "";
 
-  // Normalize — trim spaces
   text = text.trim();
 
-  // 1. Try using the first sentence
+  // First sentence if it fits
   const firstSentence = text.split('. ')[0] + '.';
-  if (firstSentence.length <= 450) {
-    return firstSentence;
-  }
+  if (firstSentence.length <= 450) return firstSentence;
 
-  // 2. If original fits — return it
-  if (text.length <= 450) {
-    return text;
-  }
+  // If whole text fits
+  if (text.length <= 450) return text;
 
-  // 3. Otherwise truncate smartly
+  // Otherwise smart truncate
   let truncated = text.slice(0, 450);
-
-  // Cut off partial words
-  truncated = truncated.replace(/\s+\S*$/, '');
-
-  return truncated + '...';
+  truncated = truncated.replace(/\s+\S*$/, ''); // cut partial words
+  return truncated + "...";
 }
 
-// ------------------------------
+// ------------------------------------------------------------
 // VALIDATION
-// ------------------------------
+// ------------------------------------------------------------
 
 const paramsAreValid = () => {
   if (!BB_TOKEN && !BB_USER) {
@@ -59,17 +51,17 @@ const paramsAreValid = () => {
     return false
   }
 
-  if (REPO == null) {
+  if (!REPO) {
     console.log('Error: specify repo')
     return false
   }
 
-  if (COMMIT == null) {
+  if (!COMMIT) {
     console.log('Error: specify commit')
     return false
   }
 
-  if (WORKSPACE == null) {
+  if (!WORKSPACE) {
     console.log('Error: specify workspace')
     return false
   }
@@ -77,137 +69,169 @@ const paramsAreValid = () => {
   return true
 }
 
+// ------------------------------------------------------------
+// SARIF PARSING HELPERS
+// ------------------------------------------------------------
 
-const rulesAsMap = (sarifRules) => {
-  return sarifRules.reduce((map, rule) => ({ ...map, [rule['id']]: rule }), {})
-}
+const severityMap = {
+  'note': 'LOW',
+  'warning': 'MEDIUM',
+  'error': 'HIGH'
+};
 
-const getPath = (sarifResult) => {
-  return sarifResult['locations'][0]['physicalLocation']['artifactLocation']['uri']
-}
+const rulesAsMap = (sarifRules) =>
+  sarifRules.reduce((map, rule) => ({ ...map, [rule['id']]: rule }), {});
 
-const getLine = (sarifResult) => {
-  const region = sarifResult['locations'][0]['physicalLocation']['region']
-  if (region['endLine'] != null) {
-    return region['endLine']
-  }
-  return region['startLine']
-}
+const getPath = (result) =>
+  result['locations'][0]['physicalLocation']['artifactLocation']['uri'];
 
-const getSummary = (sarifResult, rulesMap) => {
-  const ruleId = sarifResult['ruleId']
-  const rule = rulesMap[ruleId]
+const getLine = (result) => {
+  const region = result['locations'][0]['physicalLocation']['region'];
+  return region['endLine'] || region['startLine'];
+};
 
-  if (rule && rule['fullDescription'] != null) {
-    return rule['fullDescription']['text']
-  }
+const getRuleText = (result, rulesMap) => {
+  const rule = rulesMap[result['ruleId']];
+  if (!rule) return "";
 
-  if (rule && rule['shortDescription'] != null) {
-    return rule['shortDescription']['text']
-  }
+  if (rule.fullDescription) return rule.fullDescription.text;
+  if (rule.shortDescription) return rule.shortDescription.text;
 
-  return ""
-}
+  return "";
+};
 
+// ------------------------------------------------------------
+// SARIF → Bitbucket annotations
+// ------------------------------------------------------------
 
 const mapSarif = (sarif) => {
-  const severityMap = {
-    'note': 'LOW',
-    'warning': 'MEDIUM',
-    'error': 'HIGH'
-  }
+  const rulesMap = rulesAsMap(sarif.runs[0].tool.driver.rules);
 
-  const rulesMap = rulesAsMap(sarif['runs'][0]['tool']['driver']['rules'])
+  return sarif.runs[0].results.map(result => {
+    const fullText = getRuleText(result, rulesMap);
 
-  return sarif['runs'][0]['results']
-    .map(result => {
-      const fullSummary = getSummary(result, rulesMap);
+    return {
+      external_id: uuidv4(),
+      annotation_type: "VULNERABILITY",
+      severity: severityMap[result.level],
+      path: getPath(result),
+      line: getLine(result),
+      summary: smartSummary(fullText),
+      details: fullText || result.message.text
+    };
+  });
+};
 
-      return {
-        external_id: uuidv4(),
-        annotation_type: "VULNERABILITY",
-        severity: severityMap[result['level']],
-        path: getPath(result),
-        line: getLine(result),
+// ------------------------------------------------------------
+// Compute highest severity and counts
+// ------------------------------------------------------------
 
-        // SMART SUMMARY IMPLEMENTED HERE
-        summary: smartSummary(fullSummary),
+function computeSeverityStats(vulns) {
+  const score = { HIGH: 3, MEDIUM: 2, LOW: 1 };
+  const counts = { HIGH: 0, MEDIUM: 0, LOW: 0 };
 
-        // Full details moved here, Bitbucket allows >450 chars
-        details: fullSummary || result['message']['text']
-      }
-    })
+  vulns.forEach(v => counts[v.severity]++);
+
+  const highest =
+    counts.HIGH > 0 ? "HIGH" :
+    counts.MEDIUM > 0 ? "MEDIUM" :
+    counts.LOW > 0 ? "LOW" : null;
+
+  return { highest, counts };
 }
 
-const getScanType = (sarif) => {
-  const scanName = sarif['runs'][0]['tool']['driver']['name']
-  return {
-    id: scanName.replace(/\s+/g, "").toLowerCase(),
-    title: scanName,
-    name: scanName,
-    mapper: mapSarif,
-    count: sarif['runs'][0]['results'].length
-  }
+function severityLabel(sev) {
+  if (sev === "HIGH") return "High risk";
+  if (sev === "MEDIUM") return "Medium risk";
+  if (sev === "LOW") return "Low risk";
+  return "No findings";
 }
 
-const sarifToBitBucket = async (sarifRawOutput) => {
-  const sarifResult = JSON.parse(sarifRawOutput);
-  const scanType = getScanType(sarifResult);
+// ------------------------------------------------------------
+// MAIN LOGIC
+// ------------------------------------------------------------
 
-  let vulns = scanType.mapper(sarifResult);
+const sarifToBitBucket = async (sarifRaw) => {
+  const sarif = JSON.parse(sarifRaw);
+  const scanName = sarif.runs[0].tool.driver.name;
+  const scanId = scanName.replace(/\s+/g, "").toLowerCase();
 
-  let details = `This repository contains ${scanType['count']} ${scanType['name']} vulnerabilities`;
+  let vulns = mapSarif(sarif);
 
+  // Stats
+  const stats = computeSeverityStats(vulns);
+
+  // Determine result
+  const resultStatus =
+    stats.highest === "HIGH" ? "FAILED" :
+    stats.highest === "MEDIUM" ? "FAILED" :
+    "PASSED";
+
+  // Details section
+  const details =
+    `Security scan completed.\n\n` +
+    `Findings by severity:\n` +
+    `• HIGH: ${stats.counts.HIGH}\n` +
+    `• MEDIUM: ${stats.counts.MEDIUM}\n` +
+    `• LOW: ${stats.counts.LOW}\n\n` +
+    `Highest severity detected: ${severityLabel(stats.highest)}.\n`;
+
+  // Limit annotations (Bitbucket allows 100)
   if (vulns.length > 100) {
-    vulns = vulns.slice(0, 100)
-    details = `${details} (first 100 vulnerabilities shown)`
+    vulns = vulns.slice(0, 100);
   }
 
   const config = BB_TOKEN
-    ? { headers: { 'Authorization': `Bearer ${BB_TOKEN}` } }
-    : { auth: { username: BB_USER, password: BB_APP_PASSWORD } }
+    ? { headers: { Authorization: `Bearer ${BB_TOKEN}` } }
+    : { auth: { username: BB_USER, password: BB_APP_PASSWORD } };
 
-  // Delete previous report
+  // ------------------------------------------------------------
+  // DELETE OLD REPORT
+  // ------------------------------------------------------------
   await axios.delete(
-    `${BB_API_URL}/${WORKSPACE}/${REPO}/commit/${COMMIT}/reports/${scanType['id']}`,
+    `${BB_API_URL}/${WORKSPACE}/${REPO}/commit/${COMMIT}/reports/${scanId}`,
     config
-  )
+  );
 
-  // Create base report
+  // ------------------------------------------------------------
+  // CREATE REPORT
+  // ------------------------------------------------------------
   await axios.put(
-    `${BB_API_URL}/${WORKSPACE}/${REPO}/commit/${COMMIT}/reports/${scanType['id']}`,
+    `${BB_API_URL}/${WORKSPACE}/${REPO}/commit/${COMMIT}/reports/${scanId}`,
     {
-      title: scanType['title'],
-      details: details,
+      title: `${scanName} Security Scan`,
       report_type: "SECURITY",
-      reporter: "sarif-to-bitbucket",
-      result: "PASSED"
+      reporter: "sarif-to-bb-token",
+      result: resultStatus,
+      details: details
     },
     config
-  )
+  );
 
-  // Upload annotations (vulnerabilities)
+  // ------------------------------------------------------------
+  // UPLOAD ANNOTATIONS
+  // ------------------------------------------------------------
   await axios.post(
-    `${BB_API_URL}/${WORKSPACE}/${REPO}/commit/${COMMIT}/reports/${scanType['id']}/annotations`,
+    `${BB_API_URL}/${WORKSPACE}/${REPO}/commit/${COMMIT}/reports/${scanId}/annotations`,
     vulns,
     config
-  )
-}
+  );
+};
 
-const getInput = () => {
-  return new Promise((resolve, reject) => {
-    const stdin = process.stdin;
-    let data = '';
+// ------------------------------------------------------------
+// STDIN HANDLING
+// ------------------------------------------------------------
 
-    stdin.setEncoding('utf8');
-    stdin.on('data', (chunk) => { data += chunk });
-    stdin.on('end', () => resolve(data));
-    stdin.on('error', reject);
+const getInput = () =>
+  new Promise((resolve, reject) => {
+    let data = "";
+    process.stdin.setEncoding("utf8");
+
+    process.stdin.on("data", chunk => (data += chunk));
+    process.stdin.on("end", () => resolve(data));
+    process.stdin.on("error", reject);
   });
-}
 
 if (paramsAreValid()) {
-  getInput()
-    .then(sarifToBitBucket)
-    .catch(console.error)
+  getInput().then(sarifToBitBucket).catch(console.error);
 }
