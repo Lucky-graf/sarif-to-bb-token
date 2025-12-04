@@ -5,7 +5,6 @@ import minimist from 'minimist'
 import { v4 as uuidv4 } from 'uuid'
 
 const BB_API_URL = 'https://api.bitbucket.org/2.0/repositories'
-
 const argv = minimist(process.argv.slice(2));
 
 const BB_USER = argv['user']
@@ -14,6 +13,40 @@ const BB_TOKEN = argv['token']
 const REPO = argv['repo']
 const COMMIT = argv['commit']
 const WORKSPACE = argv['workspace']
+
+// ------------------------------
+// SMART SUMMARY IMPLEMENTATION
+// ------------------------------
+
+function smartSummary(text) {
+  if (!text) return "";
+
+  // Normalize — trim spaces
+  text = text.trim();
+
+  // 1. Try using the first sentence
+  const firstSentence = text.split('. ')[0] + '.';
+  if (firstSentence.length <= 450) {
+    return firstSentence;
+  }
+
+  // 2. If original fits — return it
+  if (text.length <= 450) {
+    return text;
+  }
+
+  // 3. Otherwise truncate smartly
+  let truncated = text.slice(0, 450);
+
+  // Cut off partial words
+  truncated = truncated.replace(/\s+\S*$/, '');
+
+  return truncated + '...';
+}
+
+// ------------------------------
+// VALIDATION
+// ------------------------------
 
 const paramsAreValid = () => {
   if (!BB_TOKEN && !BB_USER) {
@@ -44,8 +77,9 @@ const paramsAreValid = () => {
   return true
 }
 
+
 const rulesAsMap = (sarifRules) => {
-  return sarifRules.reduce((map, rule) =>  ({ ...map, [rule['id']]: rule}), {})
+  return sarifRules.reduce((map, rule) => ({ ...map, [rule['id']]: rule }), {})
 }
 
 const getPath = (sarifResult) => {
@@ -57,7 +91,6 @@ const getLine = (sarifResult) => {
   if (region['endLine'] != null) {
     return region['endLine']
   }
-
   return region['startLine']
 }
 
@@ -65,14 +98,17 @@ const getSummary = (sarifResult, rulesMap) => {
   const ruleId = sarifResult['ruleId']
   const rule = rulesMap[ruleId]
 
-  if (rule['fullDescription'] != null) {
+  if (rule && rule['fullDescription'] != null) {
     return rule['fullDescription']['text']
   }
 
-  if (rule['shortDescription'] != null) {
+  if (rule && rule['shortDescription'] != null) {
     return rule['shortDescription']['text']
   }
+
+  return ""
 }
+
 
 const mapSarif = (sarif) => {
   const severityMap = {
@@ -85,14 +121,20 @@ const mapSarif = (sarif) => {
 
   return sarif['runs'][0]['results']
     .map(result => {
+      const fullSummary = getSummary(result, rulesMap);
+
       return {
         external_id: uuidv4(),
         annotation_type: "VULNERABILITY",
         severity: severityMap[result['level']],
         path: getPath(result),
         line: getLine(result),
-        summary: getSummary(result, rulesMap),
-        details: result['message']['text']
+
+        // SMART SUMMARY IMPLEMENTED HERE
+        summary: smartSummary(fullSummary),
+
+        // Full details moved here, Bitbucket allows >450 chars
+        details: fullSummary || result['message']['text']
       }
     })
 }
@@ -109,35 +151,29 @@ const getScanType = (sarif) => {
 }
 
 const sarifToBitBucket = async (sarifRawOutput) => {
-
   const sarifResult = JSON.parse(sarifRawOutput);
   const scanType = getScanType(sarifResult);
 
-  let vulns = scanType.mapper(sarifResult)
-  let details = `This repository contains ${scanType['count']} ${scanType['name']} vulnerabilities`
+  let vulns = scanType.mapper(sarifResult);
+
+  let details = `This repository contains ${scanType['count']} ${scanType['name']} vulnerabilities`;
 
   if (vulns.length > 100) {
     vulns = vulns.slice(0, 100)
     details = `${details} (first 100 vulnerabilities shown)`
   }
 
-  const config = BB_TOKEN ? {
-    headers: {
-      'Authorization': `Bearer ${BB_TOKEN}`
-    }
-  } : {
-    auth: {
-      username: BB_USER,
-      password: BB_APP_PASSWORD
-    }
-  }
+  const config = BB_TOKEN
+    ? { headers: { 'Authorization': `Bearer ${BB_TOKEN}` } }
+    : { auth: { username: BB_USER, password: BB_APP_PASSWORD } }
 
-  // 1. Delete Existing Report
-  await axios.delete(`${BB_API_URL}/${WORKSPACE}/${REPO}/commit/${COMMIT}/reports/${scanType['id']}`,
+  // Delete previous report
+  await axios.delete(
+    `${BB_API_URL}/${WORKSPACE}/${REPO}/commit/${COMMIT}/reports/${scanType['id']}`,
     config
   )
 
-  // 2. Create Report
+  // Create base report
   await axios.put(
     `${BB_API_URL}/${WORKSPACE}/${REPO}/commit/${COMMIT}/reports/${scanType['id']}`,
     {
@@ -150,8 +186,9 @@ const sarifToBitBucket = async (sarifRawOutput) => {
     config
   )
 
-  // 3. Upload Annotations (Vulnerabilities)
-  await axios.post(`${BB_API_URL}/${WORKSPACE}/${REPO}/commit/${COMMIT}/reports/${scanType['id']}/annotations`,
+  // Upload annotations (vulnerabilities)
+  await axios.post(
+    `${BB_API_URL}/${WORKSPACE}/${REPO}/commit/${COMMIT}/reports/${scanType['id']}/annotations`,
     vulns,
     config
   )
@@ -163,18 +200,14 @@ const getInput = () => {
     let data = '';
 
     stdin.setEncoding('utf8');
-    stdin.on('data', function (chunk) {
-      data += chunk;
-    });
-
-    stdin.on('end', function () {
-      resolve(data);
-    });
-
+    stdin.on('data', (chunk) => { data += chunk });
+    stdin.on('end', () => resolve(data));
     stdin.on('error', reject);
   });
 }
 
 if (paramsAreValid()) {
-  getInput().then(sarifToBitBucket).catch(console.error)
+  getInput()
+    .then(sarifToBitBucket)
+    .catch(console.error)
 }
