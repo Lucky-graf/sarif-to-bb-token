@@ -54,17 +54,27 @@ function normalizePath(p) {
 // ------------------------------------------------------------
 function smartSummary(text) {
   if (!text) return "";
+
   text = text.trim();
 
-  const firstSentence = text.split(". ")[0] + ".";
-  if (firstSentence.length <= 450) return firstSentence;
+  const LIMIT = 450;
 
-  if (text.length <= 450) return text;
+  // If the text fits, return as-is
+  if (text.length <= LIMIT) {
+    return text;
+  }
 
-  let truncated = text.slice(0, 450);
-  truncated = truncated.replace(/\s+\S*$/, "");
-  return truncated + "...";
+  // Cut to LIMIT first
+  let cut = text.slice(0, LIMIT);
+
+  // Avoid cutting mid-word → rollback to last space
+  if (cut.includes(" ")) {
+    cut = cut.slice(0, cut.lastIndexOf(" "));
+  }
+
+  return cut + "...";
 }
+
 
 // ------------------------------------------------------------
 // ENHANCED SEVERITY INFERENCE ENGINE (v2.1.0)
