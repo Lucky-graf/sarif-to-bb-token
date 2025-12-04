@@ -173,31 +173,23 @@ function mapSarif(sarif) {
 // ------------------------------------------------------------
 function buildDetails(vulns) {
   const counts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
-  const perRule = {};
 
-  vulns.forEach(v => {
-    counts[v.severity]++;
-    perRule[v.ruleId] = (perRule[v.ruleId] ?? 0) + 1;
-  });
+  vulns.forEach(v => counts[v.severity]++);
 
   const highest =
     counts.CRITICAL > 0 ? "CRITICAL" :
-    counts.HIGH > 0     ? "HIGH" :
-    counts.MEDIUM > 0   ? "MEDIUM" : "LOW";
+    counts.HIGH > 0 ? "HIGH" :
+    counts.MEDIUM > 0 ? "MEDIUM" : "LOW";
 
+  // Bitbucket-safe formatting (no \n rendering)
   let details = "";
-  details += "Security Scan Summary\n\n";
-  details += "Findings by severity:\n";
-  details += `CRITICAL: ${counts.CRITICAL}\n`;
-  details += `HIGH: ${counts.HIGH}\n`;
-  details += `MEDIUM: ${counts.MEDIUM}\n`;
-  details += `LOW: ${counts.LOW}\n\n`;
-  details += `Highest severity: ${highest}\n\n`;
-  details += "Findings by Rule:\n";
-
-  for (const [rule, count] of Object.entries(perRule)) {
-    details += `${rule}: ${count} findings\n`;
-  }
+  details += "Security Scan Summary  ";
+  details += "Findings by severity:  ";
+  details += `• CRITICAL: ${counts.CRITICAL}  `;
+  details += `• HIGH: ${counts.HIGH}  `;
+  details += `• MEDIUM: ${counts.MEDIUM}  `;
+  details += `• LOW: ${counts.LOW}  `;
+  details += `Highest severity: ${highest}`;
 
   return { summary: details, highest };
 }
