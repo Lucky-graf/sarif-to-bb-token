@@ -185,24 +185,19 @@ function buildDetails(vulns) {
     counts.HIGH > 0     ? "HIGH" :
     counts.MEDIUM > 0   ? "MEDIUM" : "LOW";
 
-  const details =
-`**Security Scan Summary**
+  let details = "";
+  details += "Security Scan Summary\n\n";
+  details += "Findings by severity:\n";
+  details += `CRITICAL: ${counts.CRITICAL}\n`;
+  details += `HIGH: ${counts.HIGH}\n`;
+  details += `MEDIUM: ${counts.MEDIUM}\n`;
+  details += `LOW: ${counts.LOW}\n\n`;
+  details += `Highest severity: ${highest}\n\n`;
+  details += "Findings by Rule:\n";
 
-Findings by severity:
-- **CRITICAL:** ${counts.CRITICAL}
-- **HIGH:** ${counts.HIGH}
-- **MEDIUM:** ${counts.MEDIUM}
-- **LOW:** ${counts.LOW}
-
-Highest severity detected: **${highest}**
-
----
-
-**Findings by Rule:**
-${Object.entries(perRule)
-  .map(([rule, count]) => `- \`${rule}\`: **${count}** findings`)
-  .join("\n")}
-`;
+  for (const [rule, count] of Object.entries(perRule)) {
+    details += `${rule}: ${count} findings\n`;
+  }
 
   return { summary: details, highest };
 }
