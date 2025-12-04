@@ -26,12 +26,27 @@ const MAX_ANNOTATIONS = argv["max-annotations"] ?? 100;
 function normalizePath(p) {
   if (!p) return "unknown";
 
-  return p
-    .replace(/^file:\/\//, "") // remove file://
-    .replace(/^\/+/, "") // remove leading /
-    .replace(process.cwd(), "") // remove absolute root
-    .replace(/^app\//, "") // fix docker volume path
-    .trim();
+  // Convert Windows-style slashes
+  p = p.replace(/\\/g, "/");
+
+  // Remove URI prefixes like file://
+  p = p.replace(/^file:\/\//, "");
+
+  // Trim leading slashes
+  p = p.replace(/^\/+/, "");
+
+  const cwd = process.cwd().replace(/\\/g, "/");
+
+  // Remove only EXACT match of working dir prefix
+  if (p.startsWith(cwd)) {
+    p = p.slice(cwd.length);
+    p = p.replace(/^\/+/, "");
+  }
+
+  // DO NOT remove "app/" or "src/" etc.
+  // Keep the first directory level always.
+
+  return p.trim();
 }
 
 // ------------------------------------------------------------
@@ -160,41 +175,38 @@ function buildDetails(vulns) {
   const counts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
   const perRule = {};
 
-  vulns.forEach((v) => {
+  vulns.forEach(v => {
     counts[v.severity]++;
     perRule[v.ruleId] = (perRule[v.ruleId] ?? 0) + 1;
   });
 
   const highest =
-    counts.CRITICAL > 0
-      ? "CRITICAL"
-      : counts.HIGH > 0
-      ? "HIGH"
-      : counts.MEDIUM > 0
-      ? "MEDIUM"
-      : "LOW";
+    counts.CRITICAL > 0 ? "CRITICAL" :
+    counts.HIGH > 0     ? "HIGH" :
+    counts.MEDIUM > 0   ? "MEDIUM" : "LOW";
 
-  const summary = `
-### 🔐 Security Scan Summary
+  const details =
+`**Security Scan Summary**
 
-#### Findings by severity:
+Findings by severity:
 - **CRITICAL:** ${counts.CRITICAL}
 - **HIGH:** ${counts.HIGH}
 - **MEDIUM:** ${counts.MEDIUM}
 - **LOW:** ${counts.LOW}
 
-#### Highest severity: **${highest}**
+Highest severity detected: **${highest}**
 
 ---
 
-### 🔎 Findings by Rule ID:
+**Findings by Rule:**
 ${Object.entries(perRule)
-  .map(([rule, count]) => `- \`${rule}\`: **${count}**`)
+  .map(([rule, count]) => `- \`${rule}\`: **${count}** findings`)
   .join("\n")}
 `;
 
-  return { summary, highest };
+  return { summary: details, highest };
 }
+
 
 // ------------------------------------------------------------
 // MAIN FUNCTION
