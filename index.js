@@ -10,18 +10,19 @@ const argv = minimist(process.argv.slice(2));
 
 const BB_USER = argv['user']
 const BB_APP_PASSWORD = argv['password']
+const BB_TOKEN = argv['token']
 const REPO = argv['repo']
 const COMMIT = argv['commit']
 const WORKSPACE = argv['workspace']
 
 const paramsAreValid = () => {
-  if (BB_USER == null) {
-    console.log('Error: specify user')
+  if (!BB_TOKEN && !BB_USER) {
+    console.log('Error: specify either token or user')
     return false
   }
 
-  if (BB_APP_PASSWORD == null) {
-    console.log('Error: specify password')
+  if (!BB_TOKEN && !BB_APP_PASSWORD) {
+    console.log('Error: specify either token or password')
     return false
   }
 
@@ -120,17 +121,23 @@ const sarifToBitBucket = async (sarifRawOutput) => {
     details = `${details} (first 100 vulnerabilities shown)`
   }
 
+  const config = BB_TOKEN ? {
+    headers: {
+      'Authorization': `Bearer ${BB_TOKEN}`
+    }
+  } : {
+    auth: {
+      username: BB_USER,
+      password: BB_APP_PASSWORD
+    }
+  }
+
   // 1. Delete Existing Report
   await axios.delete(`${BB_API_URL}/${WORKSPACE}/${REPO}/commit/${COMMIT}/reports/${scanType['id']}`,
-    {
-      auth: {
-        username: BB_USER,
-        password: BB_APP_PASSWORD
-      }
-    }
+    config
   )
 
-  // 2. Create Report 
+  // 2. Create Report
   await axios.put(
     `${BB_API_URL}/${WORKSPACE}/${REPO}/commit/${COMMIT}/reports/${scanType['id']}`,
     {
@@ -140,23 +147,13 @@ const sarifToBitBucket = async (sarifRawOutput) => {
       reporter: "sarif-to-bitbucket",
       result: "PASSED"
     },
-    {
-      auth: {
-        username: BB_USER,
-        password: BB_APP_PASSWORD
-      }
-    }
+    config
   )
 
   // 3. Upload Annotations (Vulnerabilities)
   await axios.post(`${BB_API_URL}/${WORKSPACE}/${REPO}/commit/${COMMIT}/reports/${scanType['id']}/annotations`,
     vulns,
-    {
-      auth: {
-        username: BB_USER,
-        password: BB_APP_PASSWORD
-      }
-    }
+    config
   )
 }
 
